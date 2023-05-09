@@ -38,7 +38,14 @@ class SuperDirtHandler(Sender):
 
         self._ziffers_parser = None
 
+        self._defaults: dict = {}
+
         loop.add_child(self, setup=True)
+
+    # Global parameters
+    @property
+    def defaults(self):
+        return self._defaults
 
     # Ziffers implementation
     @property
@@ -76,11 +83,14 @@ class SuperDirtHandler(Sender):
         )
         osc_send(bun, self._name)
 
-    def __send_timed_message(self, address: str, message: list):
+    def _send_timed_message(
+        self, address: str, message: list, timestamp: Optional[int | float] = None
+    ) -> None:
         """Build and send OSC bundles"""
+        timestamp = time.time() + self._ahead_amount if timestamp is None else timestamp
         msg = oscbuildparse.OSCMessage(address, None, message)
         bun = oscbuildparse.OSCBundle(
-            oscbuildparse.unixtime2timetag(time.time() + self._ahead_amount),
+            oscbuildparse.unixtime2timetag(timestamp),
             [msg],
         )
         osc_send(bun, self._name)
@@ -89,7 +99,7 @@ class SuperDirtHandler(Sender):
         self.__send(address=address, message=message)
 
     def _dirt_play(self, message: list):
-        self.__send_timed_message(address="/dirt/play", message=message)
+        self._send_timed_message(address="/dirt/play", message=message)
 
     def _dirt_panic(self):
         self._dirt_play(message=["sound", "superpanic"])
@@ -146,10 +156,11 @@ class SuperDirtHandler(Sender):
 
         # Replace some shortcut parameters by their real name
         pattern = self._parse_aliases(pattern)
+        pattern = {**self._defaults, **pattern}
 
         pattern["sound"] = sound
         pattern["orbit"] = orbit
-        pattern["cps"] = round(self.env.clock.phase, 4)
+        pattern["cps"] = round(self.env.clock.phase, 1)
         pattern["cycle"] = (
             self.env.clock.bar * self.env.clock.beats_per_bar
         ) + self.env.clock.beat
@@ -174,10 +185,12 @@ class SuperDirtHandler(Sender):
         rate: NumericElement = 1,
         key: str = "C4",
         scale: str = "IONIAN",
+        degrees: bool = False,
         **pattern: ParsableElement,
     ) -> int | float:
         # Replace some shortcut parameters by their real name
         pattern = self._parse_aliases(pattern)
+        pattern = {**self._defaults, **pattern}
 
         if self.apply_conditional_mask_to_bars(
             pattern=pattern,
@@ -187,7 +200,7 @@ class SuperDirtHandler(Sender):
         if not self._ziffers_parser:
             raise Exception("The ziffers package is not imported!")
         else:
-            ziffer = self._ziffers_parser(ziff, scale=scale, key=key)[iterator]
+            ziffer = self._ziffers_parser(ziff, scale=scale, key=key, degrees=degrees)[iterator]
             try:
                 freq = ziffer.freq
             except AttributeError:  # if there is no note, it must be a silence

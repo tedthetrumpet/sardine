@@ -10,17 +10,10 @@ from . import *
 from .io.UserConfig import read_user_configuration
 from .logger import print
 from .sequences import ListParser, ziffers_factory
+from .sequences.tidal_parser import *
 from .superdirt import SuperDirtProcess
 from .utils import config_line_printer, get_snap_deadline, join, sardine_intro
-
-try:
-    from ziffers import z
-
-    ziffers_imported: bool = True
-except ImportError:
-    print("Install the ziffers package for using Ziffers patterns")
-    ziffers_imported: bool = False
-
+from ziffers import z
 
 ParamSpec = ParamSpec("PS")
 T = TypeVar("T")
@@ -81,8 +74,7 @@ try:
     # MIDI Handler: matching with the MIDI port defined in the configuration file
     midi = MidiHandler(port_name=str(config.midi))
     bowl.add_handler(midi)
-    if ziffers_imported:
-        midi._ziffers_parser = z
+    midi._ziffers_parser = z
 except OSError as e:
     print(f"{e}: [red]Invalid MIDI port![/red]")
 
@@ -92,8 +84,7 @@ try:
         target=ControlTarget(channel=0, control=20), port_name=config.midi
     )
     bowl.add_handler(midi)
-    if ziffers_imported:
-        midi._ziffers_parser = z
+    midi._ziffers_parser = z
 except OSError as e:
     print(f"{e}: [red]Invalid MIDI port![/red]")
 
@@ -120,8 +111,7 @@ O = dummy_osc.send
 # SuperDirt Handler: conditional
 if config.superdirt_handler:
     dirt = SuperDirtHandler(loop=osc_loop)
-    if ziffers_imported:
-        dirt._ziffers_parser = z
+    dirt._ziffers_parser = z
 
 # Adding Players
 # player_names = ["P" + l for l in ascii_lowercase + ascii_uppercase]
@@ -186,6 +176,7 @@ def swim(
     *args,
     snap: Optional[Union[float, int]] = 0,
     until: Optional[int] = None,
+    background_job: bool = False,
     **kwargs,
 ):
     """
@@ -206,6 +197,10 @@ def swim(
         until (Optional[int]):
             Specifies the number of iterations this function should run for.
             This is a shorthand for using the `@for_()` decorator.
+        background_job (bool):
+            Determines if the asyncrunner is a background job or not. Being a
+            background job isolates the asyncrunner from any interruption by
+            the user (silence() or panic()).
         **kwargs: Keyword arguments to be passed to `func.`
     """
 
@@ -221,6 +216,8 @@ def swim(
         runner = bowl.scheduler.get_runner(func.__name__)
         if runner is None:
             runner = AsyncRunner(func.__name__)
+            if background_job:
+                runner.background_job = True
         elif not runner.is_running():
             # Runner has likely stopped swimming, in which case
             # we should make sure the old state doesn't pollute
@@ -349,14 +346,21 @@ def silence(*runners: AsyncRunner) -> None:
     if len(runners) == 0:
         midi.all_notes_off()
         bowl.scheduler.reset()
+        hush()
         return
 
     for run in runners:
         if isinstance(run, Player):
             run.stop()
         else:
-            bowl.scheduler.stop_runner(run)
+            if not run.background_job:
+                bowl.scheduler.stop_runner(run)
+        if config.superdirt_handler:
+            hush()
 
+def solo(pattern):
+    """Soloing a single player out of all running players"""
+    [silence(pat) for pat in bowl.scheduler.runners if pat.name != pattern.name]
 
 def panic(*runners: AsyncRunner) -> None:
     """
@@ -423,8 +427,7 @@ I, V = bowl.iterators, bowl.variables  # Iterators and Variables from env
 P = Pat  # Generic pattern interface
 
 N = midi.send  # For sending MIDI Notes
-if ziffers_imported:
-    ZN = midi.send_ziffers
+ZN = midi.send_ziffers
 PC = midi.send_program  # For MIDI Program changes
 CC = midi.send_control  # For MIDI Control Change messages
 SY = midi.send_sysex  # For MIDI Sysex messages
@@ -453,8 +456,7 @@ def pc(*args, **kwargs):
 
 if config.superdirt_handler:
     D = dirt.send
-    if ziffers_imported:
-        ZD = dirt.send_ziffers
+    ZD = dirt.send_ziffers
 
     def d(*args, **kwargs):
         return _play_factory(dirt, dirt.send, *args, **kwargs)
@@ -462,8 +464,6 @@ if config.superdirt_handler:
     def zd(*args, **kwargs):
         return _play_factory(dirt, dirt.send_ziffers, *args, **kwargs)
 
-
-if ziffers_imported:
     zplay = ziffers_factory.create_zplay(D, N, sleep, swim)
 
 
@@ -572,16 +572,56 @@ def MIDIController(
 
 
 #######################################################################################
+# VORTEX
+
+if config.superdirt_handler:
+    tidal = tidal_factory(
+        osc_client=dirt, env=bowl, tidal_players=bowl._vortex_subscribers
+    )
+    hush = hush_factory(
+        osc_client=dirt, env=bowl, tidal_players=bowl._vortex_subscribers
+    )
+
+    class TidalD:
+        def __init__(self, name: str, orbit_number: int):
+            self.name = name
+            self.orbit_number = orbit_number
+            self.player: Optional[tidal] = None
+
+        def __mul__(self, pattern):
+            self.player = tidal(self.name, pattern.orbit(self.orbit_number))
+            return self.player
+
+        def _stream(self):
+            """Return the last message played by this stream/player"""
+            return self.player.get()
+
+        @property
+        def stream(self):
+            """Getter for the stream"""
+            data = self._stream()
+            return {} if data is None else data
+
+    d1, d2, d3, d4, d5, d6, d7, d8, d9 = (
+            TidalD(name="d1", orbit_number=0),
+            TidalD(name="d2", orbit_number=1),
+            TidalD(name="d3", orbit_number=2),
+            TidalD(name="d4", orbit_number=3),
+            TidalD(name="d5", orbit_number=4),
+            TidalD(name="d6", orbit_number=5),
+            TidalD(name="d7", orbit_number=6),
+            TidalD(name="d8", orbit_number=7),
+            TidalD(name="d9", orbit_number=8),
+    )
+
+    # Background asyncrunner for running tidal patterns
+    @swim(background_job=True)
+    def tidal_loop(p=0.05 / 2):
+        """Background Tidal/Vortex AsyncRunner"""
+        clock._notify_tidal_streams()
+        again(tidal_loop, p=0.05 / 2)
+
+
+#######################################################################################
 # CLOCK START: THE SESSION IS NOW LIVE
 bowl.start()
-
-try:
-    # MIDI Handler: matching with the MIDI port defined in the configuration file
-    bitwig = MidiHandler(port_name="MIDI Bus 1")
-    bowl.add_handler(bitwig)
-    if ziffers_imported:
-        bitwig._ziffers_parser = bz
-except OSError as e:
-    print(f"{e}: [red]Invalid MIDI port![/red]")
-def drum(*args, **kwargs):
-    return _play_factory(bitwig, bitwig.send, *args, **kwargs)

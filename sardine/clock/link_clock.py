@@ -1,6 +1,8 @@
 from typing import Optional, Union
 
 import link
+import math
+from time import time
 
 from ..base import BaseClock, BaseThreadedLoopMixin
 
@@ -19,14 +21,92 @@ class LinkClock(BaseThreadedLoopMixin, BaseClock):
         super().__init__(loop_interval=loop_interval)
 
         self._link: Optional[link.Link] = None
+        self._tick: int = 0
         self._beat: int = 0
         self._beat_duration: float = 0.0
         self._beats_per_bar: int = bpb
         self._internal_origin: float = 0.0
         self._internal_time: float = 0.0
+        self._last_capture: Optional[link.SessionState] = None
         self._phase: float = 0.0
         self._playing: bool = False
         self._tempo: float = float(tempo)
+        self._tidal_nudge: int = 0
+        self._link_time: int = 0
+        self._beats_per_cycle: int = 4
+        self._framerate: float = 1 / 20
+
+    ## VORTEX   ################################################
+
+    def get_cps(self) -> int | float:
+        """Get the BPM in cycles per second (Tidal approach to time)"""
+        return self.tempo / self._beats_per_bar / 60.0
+
+    @property
+    def cps(self) -> int | float:
+        """Return the current cps"""
+        return self.get_cps()
+
+    @property
+    def tick(self) -> int | float:
+        """Return the current clock tick"""
+        return self._tick
+
+    @tick.setter
+    def tick(self, value: int) -> None:
+        """Set the current clock tick"""
+        self._tick = value
+
+    @cps.setter
+    def cps(self, value: int | float) -> None:
+        self.tempo = value * self._beats_per_bar * 60.0
+
+    @property
+    def bps(self) -> int|float:
+        """Return the number of beats that can fit into a second"""
+        return 1.0 / self.beat_duration
+
+    def beatAtTime(self, time: int|float) -> float:
+        """Equivalent to Ableton Link beatAtTime method"""
+        return (time - self.internal_origin) * self.bps
+
+    def timeAtBeat(self, beat: float) -> float:
+        """Equivalent to Ableton Link timeAtBeat method"""
+        return self.internal_origin + (self.beat / self.bps)
+
+    def _notify_tidal_streams(self):
+        """
+        Notify Tidal Streams of the current passage of time.
+        """
+        self.tick += 1
+
+        # Logical time since the clock started ticking: sum of frames
+        logical_now, logical_next = (
+            self.internal_origin + (self.tick * self._framerate),
+            self.internal_origin + ((self.tick + 1) * self._framerate),
+        )
+
+        # Current time (needed for knowing wall clock time)
+        now = self.shifted_time + self._tidal_nudge
+
+        # Wall clock time for the "ideal" logical time 
+        cycle_from, cycle_to = (
+                self.beatAtTime(logical_now) / (self.beats_per_bar * 2),
+                self.beatAtTime(logical_next) / (self.beats_per_bar * 2),
+        )
+
+        # Sending to each individual subscriber for scheduling using timestamps
+        try:
+            for sub in self.env._vortex_subscribers:
+                sub.notify_tick(
+                    clock=self,
+                    cycle=(cycle_from, cycle_to),
+                    cycles_per_second=self.cps,
+                    beats_per_cycle=(self.beats_per_bar * 2),
+                    now=now,
+                )
+        except Exception as e:
+            print(e)
 
     ## GETTERS  ################################################
 
@@ -88,13 +168,14 @@ class LinkClock(BaseThreadedLoopMixin, BaseClock):
 
     def _capture_link_info(self):
         s: link.SessionState = self._link.captureSessionState()
-        link_time: int = self._link.clock().micros()
-        beat: float = s.beatAtTime(link_time, self.beats_per_bar)
-        phase: float = s.phaseAtTime(link_time, self.beats_per_bar)
+        self._last_capture = s
+        self._link_time: int = self._link.clock().micros()
+        beat: float = s.beatAtTime(self._link_time, self.beats_per_bar)
+        phase: float = s.phaseAtTime(self._link_time, self.beats_per_bar)
         playing: bool = s.isPlaying()
         tempo: float = s.tempo()
 
-        self._internal_time = link_time / 1_000_000
+        self._internal_time = self._link_time / 1_000_000
         self._beat = int(beat)
         self._beat_duration = 60 / tempo
         # Sardine phase is typically defined from 0.0 to the beat duration.
